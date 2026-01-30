@@ -169,9 +169,8 @@ class ESP32Bridge:
 
         return responses
 
-
     def send_audio(self, wav_audio: bytes) -> bool:
-        """Send audio to ESP32 speaker"""
+        """Send audio to ESP32 speaker in chunks"""
         if not self.connected or not wav_audio:
             return False
 
@@ -179,72 +178,76 @@ class ESP32Bridge:
             # Extract raw PCM from WAV
             raw_pcm, sample_rate, channels, sample_width = extract_raw_pcm(wav_audio)
 
-            # Cap to ESP32 buffer size (80000 bytes)
-            max_size = 80000
-            if len(raw_pcm) > max_size:
-                logger.warning(f"Audio too long ({len(raw_pcm)} bytes), truncating to {max_size}")
-                raw_pcm = raw_pcm[:max_size]
+            total_size = len(raw_pcm)
+            chunk_max = 75000  # Slightly under 80KB buffer
+            offset = 0
+            chunk_num = 1
+            total_chunks = (total_size + chunk_max - 1) // chunk_max
 
-            audio_size = len(raw_pcm)
-            logger.info(f"Sending {audio_size} bytes of PCM audio")
+            logger.info(f"Total audio: {total_size} bytes, sending in {total_chunks} chunks")
 
-            # Clear serial buffers
-            self.serial.reset_input_buffer()
-            self.serial.reset_output_buffer()
-            time.sleep(0.1)
+            while offset < total_size:
+                # Get this chunk
+                chunk_data = raw_pcm[offset:offset + chunk_max]
+                chunk_size = len(chunk_data)
 
-            # Send AUDIO_START with size
-            cmd = f'{{"type":"AUDIO_START","size":{audio_size}}}\n'
-            logger.info(f"Sending: {cmd.strip()}")
-            self.serial.write(cmd.encode())
-            self.serial.flush()
+                logger.info(f"Chunk {chunk_num}/{total_chunks}: {chunk_size} bytes")
 
-            # Wait for AUDIO_READY
-            ready = False
-            start_time = time.time()
-
-            while time.time() - start_time < 3:
-                if self.serial.in_waiting:
-                    response = self.serial.readline().decode('utf-8', errors='ignore').strip()
-                    logger.info(f"ESP32: {response}")
-                    if "AUDIO_READY" in response:
-                        ready = True
-                        break
+                # Clear serial buffers
+                self.serial.reset_input_buffer()
+                self.serial.reset_output_buffer()
                 time.sleep(0.05)
 
-            if not ready:
-                logger.warning("No AUDIO_READY received")
-                return False
+                # Send AUDIO_START with size
+                cmd = f'{{"type":"AUDIO_START","size":{chunk_size}}}\n'
+                self.serial.write(cmd.encode())
+                self.serial.flush()
 
-            # Send raw PCM data in chunks
-            chunk_size = 1024
-            total_sent = 0
+                # Wait for AUDIO_READY
+                ready = False
+                start_time = time.time()
+                while time.time() - start_time < 3:
+                    if self.serial.in_waiting:
+                        response = self.serial.readline().decode('utf-8', errors='ignore').strip()
+                        if "AUDIO_READY" in response:
+                            ready = True
+                            break
+                    time.sleep(0.02)
 
-            logger.info(f"Streaming {audio_size} bytes...")
+                if not ready:
+                    logger.warning("No AUDIO_READY received")
+                    return False
 
-            for i in range(0, audio_size, chunk_size):
-                chunk = raw_pcm[i:i + chunk_size]
-                self.serial.write(chunk)
-                total_sent += len(chunk)
-                time.sleep(0.005)  # Small delay to prevent overflow
+                # Send chunk data
+                send_chunk_size = 1024
+                for i in range(0, chunk_size, send_chunk_size):
+                    self.serial.write(chunk_data[i:i + send_chunk_size])
+                    time.sleep(0.003)
 
-            self.serial.flush()
-            logger.info(f"✅ Sent {total_sent} bytes")
+                self.serial.flush()
 
-            # Wait for playback
-            playback_time = audio_size / 44100
-            logger.info(f"Waiting {playback_time:.1f}s for playback...")
+                # Wait for DONE
+                playback_time = chunk_size / 44100
+                start_time = time.time()
+                done = False
 
-            start_time = time.time()
-            while time.time() - start_time < playback_time + 3:
-                if self.serial.in_waiting:
-                    response = self.serial.readline().decode('utf-8', errors='ignore').strip()
-                    if response:
-                        logger.info(f"ESP32: {response}")
-                        if "DONE" in response:
-                            return True
-                time.sleep(0.1)
+                while time.time() - start_time < playback_time + 3:
+                    if self.serial.in_waiting:
+                        response = self.serial.readline().decode('utf-8', errors='ignore').strip()
+                        if response:
+                            logger.debug(f"ESP32: {response}")
+                            if "DONE" in response:
+                                done = True
+                                break
+                    time.sleep(0.05)
 
+                if not done:
+                    logger.warning(f"Chunk {chunk_num} playback timeout")
+
+                offset += chunk_size
+                chunk_num += 1
+
+            logger.info("✅ All audio chunks sent and played")
             return True
 
         except Exception as e:
