@@ -37,10 +37,7 @@ logger = logging.getLogger("freya")
 
 
 def extract_raw_pcm(audio_bytes: bytes) -> tuple:
-    """
-    Extract raw PCM data from WAV file bytes.
-    Returns (pcm_data, sample_rate, channels, sample_width)
-    """
+    """Extract raw PCM and amplify volume"""
     try:
         wav_io = io.BytesIO(audio_bytes)
 
@@ -50,9 +47,23 @@ def extract_raw_pcm(audio_bytes: bytes) -> tuple:
             frame_rate = wav_file.getframerate()
             n_frames = wav_file.getnframes()
 
-            logger.info(f"WAV: {n_channels}ch, {sample_width*8}bit, {frame_rate}Hz, {n_frames} frames")
+            logger.info(f"WAV: {n_channels}ch, {sample_width * 8}bit, {frame_rate}Hz, {n_frames} frames")
 
             pcm_data = wav_file.readframes(n_frames)
+
+        # Amplify volume (multiply samples by 2-3x)
+        import struct
+        samples = struct.unpack(f'<{len(pcm_data) // 2}h', pcm_data)
+        amplified = []
+        gain = 3.0  # Adjust this: 1.0 = normal, 2.0 = 2x louder, 3.0 = 3x louder
+
+        for s in samples:
+            new_val = int(s * gain)
+            # Clamp to 16-bit range to prevent distortion
+            new_val = max(-32768, min(32767, new_val))
+            amplified.append(new_val)
+
+        pcm_data = struct.pack(f'<{len(amplified)}h', *amplified)
 
         return pcm_data, frame_rate, n_channels, sample_width
 
@@ -169,36 +180,35 @@ class ESP32Bridge:
 
         return responses
 
+    # ==================== REPLACE send_audio METHOD IN ESP32Bridge CLASS ====================
+
     def send_audio(self, wav_audio: bytes) -> bool:
         """Send audio to ESP32 speaker in chunks"""
         if not self.connected or not wav_audio:
             return False
 
         try:
-            # Extract raw PCM from WAV
             raw_pcm, sample_rate, channels, sample_width = extract_raw_pcm(wav_audio)
 
             total_size = len(raw_pcm)
-            chunk_max = 75000  # Slightly under 80KB buffer
+            chunk_max = 79000  # Under 80KB buffer limit
             offset = 0
             chunk_num = 1
             total_chunks = (total_size + chunk_max - 1) // chunk_max
 
-            logger.info(f"Total audio: {total_size} bytes, sending in {total_chunks} chunks")
+            logger.info(f"Total audio: {total_size} bytes in {total_chunks} chunks")
 
             while offset < total_size:
-                # Get this chunk
                 chunk_data = raw_pcm[offset:offset + chunk_max]
                 chunk_size = len(chunk_data)
 
                 logger.info(f"Chunk {chunk_num}/{total_chunks}: {chunk_size} bytes")
 
-                # Clear serial buffers
                 self.serial.reset_input_buffer()
                 self.serial.reset_output_buffer()
                 time.sleep(0.05)
 
-                # Send AUDIO_START with size
+                # Send AUDIO_START with THIS chunk's size
                 cmd = f'{{"type":"AUDIO_START","size":{chunk_size}}}\n'
                 self.serial.write(cmd.encode())
                 self.serial.flush()
@@ -215,47 +225,38 @@ class ESP32Bridge:
                     time.sleep(0.02)
 
                 if not ready:
-                    logger.warning("No AUDIO_READY received")
+                    logger.warning("No AUDIO_READY")
                     return False
 
-                # Send chunk data
-                send_chunk_size = 1024
-                for i in range(0, chunk_size, send_chunk_size):
-                    self.serial.write(chunk_data[i:i + send_chunk_size])
+                # Send this chunk
+                for i in range(0, chunk_size, 1024):
+                    self.serial.write(chunk_data[i:i + 1024])
                     time.sleep(0.003)
 
                 self.serial.flush()
 
-                # Wait for DONE
+                # Wait for DONE before sending next chunk
                 playback_time = chunk_size / 44100
                 start_time = time.time()
-                done = False
 
-                while time.time() - start_time < playback_time + 3:
+                while time.time() - start_time < playback_time + 5:
                     if self.serial.in_waiting:
                         response = self.serial.readline().decode('utf-8', errors='ignore').strip()
                         if response:
                             logger.debug(f"ESP32: {response}")
                             if "DONE" in response:
-                                done = True
                                 break
                     time.sleep(0.05)
-
-                if not done:
-                    logger.warning(f"Chunk {chunk_num} playback timeout")
 
                 offset += chunk_size
                 chunk_num += 1
 
-            logger.info("✅ All audio chunks sent and played")
+            logger.info("✅ All chunks played")
             return True
 
         except Exception as e:
             logger.error(f"Audio send failed: {e}")
-            import traceback
-            traceback.print_exc()
             return False
-
 
 class PCMicListener:
     """Handles PC/Headphone microphone input"""
