@@ -1,11 +1,16 @@
 """
-FREYA - AI Voice Assistant (PC Mic + ESP32 Speaker/OLED)
-========================================================
+FREYA — AI Voice Assistant (ESP32 Only)
+========================================
 
-Flow:
-  Headphone Mic → Whisper STT → Gemini LLM → Piper TTS → ESP32 Speaker
-                                    ↓
-                              OLED Emotions
+Full pipeline on ESP32 hardware:
+  ESP32 INMP441 Mic → Serial → Whisper STT → Gemini LLM → Piper TTS → Serial → ESP32 Speaker
+
+No PC microphone. No PC speaker fallback. ESP32 only.
+
+Usage:
+  python main.py                # default
+  python main.py --port COM5    # specify COM port
+  python main.py --test         # hardware diagnostics only
 """
 
 import logging
@@ -14,493 +19,282 @@ import time
 import re
 import tempfile
 import os
-import wave
-import io
 from pathlib import Path
 
-import serial
-import speech_recognition as sr
-
-# Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
-
-from services.stt_service import WhisperSTTService
-from services.llm_service import LLMService
-from services.tts_service import PiperTTSService
-from config import settings
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s [%(name)s] %(levelname)s: %(message)s'
 )
 logger = logging.getLogger("freya")
 
 
-def extract_raw_pcm(audio_bytes: bytes) -> tuple:
-    """Extract raw PCM and amplify volume"""
-    try:
-        wav_io = io.BytesIO(audio_bytes)
-
-        with wave.open(wav_io, 'rb') as wav_file:
-            n_channels = wav_file.getnchannels()
-            sample_width = wav_file.getsampwidth()
-            frame_rate = wav_file.getframerate()
-            n_frames = wav_file.getnframes()
-
-            logger.info(f"WAV: {n_channels}ch, {sample_width * 8}bit, {frame_rate}Hz, {n_frames} frames")
-
-            pcm_data = wav_file.readframes(n_frames)
-
-        # Amplify volume (multiply samples by 2-3x)
-        import struct
-        samples = struct.unpack(f'<{len(pcm_data) // 2}h', pcm_data)
-        amplified = []
-        gain = 3.0  # Adjust this: 1.0 = normal, 2.0 = 2x louder, 3.0 = 3x louder
-
-        for s in samples:
-            new_val = int(s * gain)
-            # Clamp to 16-bit range to prevent distortion
-            new_val = max(-32768, min(32767, new_val))
-            amplified.append(new_val)
-
-        pcm_data = struct.pack(f'<{len(amplified)}h', *amplified)
-
-        return pcm_data, frame_rate, n_channels, sample_width
-
-    except Exception as e:
-        logger.error(f"Failed to extract PCM: {e}")
-        return audio_bytes, 22050, 1, 2
-
-
-class ESP32Bridge:
-    """Handles communication with ESP32"""
-
-    EMOTION_MAP = {
-        "neutral": "0", "normal": "0", "thinking": "0", "listening": "0",
-        "happy": "1", "excited": "1", "joy": "1", "laugh": "1",
-        "sad": "2", "worried": "2",
-        "surprised": "3", "confused": "3", "curious": "3",
-        "angry": "4", "annoyed": "4", "frustrated": "4",
-        "sleepy": "5", "tired": "5", "bored": "5",
-        "wink": "6", "flirty": "6", "playful": "6",
-        "love": "7", "loving": "7", "caring": "7",
-    }
-
-    def __init__(self, port: str, baudrate: int = 115200):
-        self.port = port
-        self.baudrate = baudrate
-        self.serial = None
-        self.connected = False
-
-    def connect(self) -> bool:
-        try:
-            self.serial = serial.Serial(
-                port=self.port,
-                baudrate=self.baudrate,
-                timeout=2,
-                write_timeout=2
-            )
-            time.sleep(2)  # Wait for ESP32 reset
-
-            # Clear buffers
-            self.serial.reset_input_buffer()
-            self.serial.reset_output_buffer()
-
-            self.connected = True
-            logger.info(f"✅ Connected to ESP32 on {self.port}")
-
-            # Read any startup messages
-            time.sleep(0.5)
-            while self.serial.in_waiting:
-                line = self.serial.readline().decode('utf-8', errors='ignore').strip()
-                if line:
-                    logger.debug(f"ESP32: {line}")
-
-            return True
-        except Exception as e:
-            logger.error(f"❌ Failed to connect: {e}")
-            self.connected = False
-            return False
-
-    def disconnect(self):
-        if self.serial and self.serial.is_open:
-            self.serial.close()
-        self.connected = False
-
-    def send_emotion(self, emotion: str):
-        if not self.connected:
-            return
-
-        cmd = self.EMOTION_MAP.get(emotion.lower().strip(), "0")
-
-        try:
-            self.serial.write(cmd.encode())
-            self.serial.flush()
-            logger.info(f"😊 Emotion: {emotion} → '{cmd}'")
-        except Exception as e:
-            logger.error(f"Emotion send failed: {e}")
-
-    def play_melody(self) -> bool:
-        if not self.connected:
-            return False
-        try:
-            self.serial.write(b'm')
-            self.serial.flush()
-            time.sleep(2)
-            return True
-        except:
-            return False
-
-    def play_beep(self):
-        if not self.connected:
-            return
-        try:
-            self.serial.write(b'9')
-            self.serial.flush()
-            time.sleep(0.15)
-        except:
-            pass
-
-    def _read_responses(self, timeout: float = 0.5) -> list:
-        """Read all available responses from ESP32"""
-        responses = []
-        start = time.time()
-
-        while time.time() - start < timeout:
-            if self.serial.in_waiting:
-                try:
-                    line = self.serial.readline().decode('utf-8', errors='ignore').strip()
-                    if line:
-                        responses.append(line)
-                        logger.debug(f"ESP32: {line}")
-                except:
-                    pass
-            else:
-                time.sleep(0.01)
-
-        return responses
-
-    # ==================== REPLACE send_audio METHOD IN ESP32Bridge CLASS ====================
-
-    def send_audio(self, wav_audio: bytes) -> bool:
-        """Send audio to ESP32 speaker in chunks"""
-        if not self.connected or not wav_audio:
-            return False
-
-        try:
-            raw_pcm, sample_rate, channels, sample_width = extract_raw_pcm(wav_audio)
-
-            total_size = len(raw_pcm)
-            chunk_max = 79000  # Under 80KB buffer limit
-            offset = 0
-            chunk_num = 1
-            total_chunks = (total_size + chunk_max - 1) // chunk_max
-
-            logger.info(f"Total audio: {total_size} bytes in {total_chunks} chunks")
-
-            while offset < total_size:
-                chunk_data = raw_pcm[offset:offset + chunk_max]
-                chunk_size = len(chunk_data)
-
-                logger.info(f"Chunk {chunk_num}/{total_chunks}: {chunk_size} bytes")
-
-                self.serial.reset_input_buffer()
-                self.serial.reset_output_buffer()
-                time.sleep(0.05)
-
-                # Send AUDIO_START with THIS chunk's size
-                cmd = f'{{"type":"AUDIO_START","size":{chunk_size}}}\n'
-                self.serial.write(cmd.encode())
-                self.serial.flush()
-
-                # Wait for AUDIO_READY
-                ready = False
-                start_time = time.time()
-                while time.time() - start_time < 3:
-                    if self.serial.in_waiting:
-                        response = self.serial.readline().decode('utf-8', errors='ignore').strip()
-                        if "AUDIO_READY" in response:
-                            ready = True
-                            break
-                    time.sleep(0.02)
-
-                if not ready:
-                    logger.warning("No AUDIO_READY")
-                    return False
-
-                # Send this chunk
-                for i in range(0, chunk_size, 1024):
-                    self.serial.write(chunk_data[i:i + 1024])
-                    time.sleep(0.003)
-
-                self.serial.flush()
-
-                # Wait for DONE before sending next chunk
-                playback_time = chunk_size / 44100
-                start_time = time.time()
-
-                while time.time() - start_time < playback_time + 5:
-                    if self.serial.in_waiting:
-                        response = self.serial.readline().decode('utf-8', errors='ignore').strip()
-                        if response:
-                            logger.debug(f"ESP32: {response}")
-                            if "DONE" in response:
-                                break
-                    time.sleep(0.05)
-
-                offset += chunk_size
-                chunk_num += 1
-
-            logger.info("✅ All chunks played")
-            return True
-
-        except Exception as e:
-            logger.error(f"Audio send failed: {e}")
-            return False
-
-class PCMicListener:
-    """Handles PC/Headphone microphone input"""
-
-    def __init__(self, device_index: int = None):
-        self.recognizer = sr.Recognizer()
-        self.device_index = device_index
-
-        print("\n🎤 Available microphones:")
-        for i, mic_name in enumerate(sr.Microphone.list_microphone_names()):
-            print(f"   [{i}] {mic_name}")
-        print()
-
-        self.microphone = sr.Microphone(device_index=device_index)
-
-        logger.info("🎤 Calibrating microphone...")
-        with self.microphone as source:
-            self.recognizer.adjust_for_ambient_noise(source, duration=1)
-        logger.info("✅ Microphone ready")
-
-    def listen(self, timeout: int = 5, phrase_limit: int = 15) -> bytes:
-        try:
-            with self.microphone as source:
-                audio = self.recognizer.listen(
-                    source,
-                    timeout=timeout,
-                    phrase_time_limit=phrase_limit
-                )
-                return audio.get_wav_data()
-        except sr.WaitTimeoutError:
-            logger.warning("⏰ Listening timed out")
-            return None
-        except Exception as e:
-            logger.error(f"Mic error: {e}")
-            return None
-
-
 class EmotionExtractor:
-    EMOTION_PATTERN = re.compile(r'\((\w+)\)\s*$')
-    VALID_EMOTIONS = {'neutral', 'happy', 'sad', 'surprised', 'angry', 'sleepy', 'wink', 'love',
-                      'laugh', 'excited', 'confused', 'worried', 'curious', 'tired', 'playful', 'loving'}
+    """Extracts emotion tags from LLM responses: 'Hello! (happy)' -> ('Hello!', 'happy')"""
+
+    PATTERN = re.compile(r'\((\w+)\)\s*$')
+    VALID = {
+        'neutral', 'happy', 'sad', 'surprised', 'angry', 'sleepy',
+        'wink', 'love', 'thinking'
+    }
 
     @classmethod
     def extract(cls, text: str) -> tuple:
-        match = cls.EMOTION_PATTERN.search(text)
+        match = cls.PATTERN.search(text)
         if match:
             emotion = match.group(1).lower()
-            clean_text = text[:match.start()].strip()
-            if emotion in cls.VALID_EMOTIONS:
-                return clean_text, emotion
+            if emotion in cls.VALID:
+                return text[:match.start()].strip(), emotion
         return text.strip(), "neutral"
 
 
 class FreyaAssistant:
-    def __init__(self, mic_device: int = None):
+    def __init__(self, esp_port: str = None):
         print("\n" + "=" * 50)
-        print("🤖 FREYA VOICE ASSISTANT - Initializing")
+        print("   FREYA — AI Voice Assistant (ESP32 Only)")
         print("=" * 50 + "\n")
 
-        self.mic = PCMicListener(device_index=mic_device)
+        # ---- Import services ----
+        from services.stt_service import WhisperSTTService
+        from services.llm_service import LLMService
+        from services.tts_service import PiperTTSService
+        from communication.serial_handler import SerialBridge
+        from config import settings
 
-        logger.info("Loading Whisper STT...")
+        # ---- Whisper STT ----
+        logger.info("Loading Whisper...")
         self.stt = WhisperSTTService()
-        logger.info("✅ Whisper ready")
+        logger.info("Whisper ready")
 
-        logger.info("Loading Gemini LLM...")
+        # ---- Gemini LLM ----
+        logger.info("Loading Gemini...")
         self.llm = LLMService()
-        logger.info("✅ Gemini ready")
+        logger.info("Gemini ready")
 
+        # ---- Piper TTS ----
         logger.info("Loading Piper TTS...")
         self.tts = PiperTTSService()
-        logger.info("✅ Piper ready")
+        logger.info("Piper ready")
 
-        self.esp32 = ESP32Bridge(
-            port=settings.ESP32_COM_PORT,
-            baudrate=115200
-        )
+        # ---- ESP32 Connection ----
+        port = esp_port or getattr(settings, 'ESP32_COM_PORT', 'COM4')
+        self.esp32 = SerialBridge(port=port)
 
-        if self.esp32.connect():
-            print("\n--- Hardware Test ---")
-            print("🔊 Testing speaker...")
-            self.esp32.play_melody()
-            print("✅ Speaker OK")
+        if not self.esp32.connect():
+            logger.error("Failed to connect to ESP32!")
+            print("\nCould not connect to ESP32. Check:")
+            print("  1. ESP32 is plugged in via USB")
+            print("  2. Correct COM port (use --port COMx)")
+            print("  3. No other program has the port open")
+            print("  4. New firmware (main.cpp) is flashed")
+            sys.exit(1)
 
-            print("😊 Testing emotions...")
-            for emotion in ["happy", "surprised", "love"]:
-                self.esp32.send_emotion(emotion)
-                time.sleep(0.5)
-            self.esp32.send_emotion("neutral")
-            print("✅ OLED OK")
-            print("-" * 20 + "\n")
+        # ---- Hardware test ----
+        self._run_hardware_test()
+        print("\nFreya is ready!\n")
 
-        print("✅ Freya is ready!\n")
+    def _run_hardware_test(self):
+        print("--- Hardware Check ---")
+
+        # Speaker
+        print("  Speaker: ", end="", flush=True)
+        if self.esp32.test_speaker():
+            print("OK")
+        else:
+            print("No response (check firmware)")
+
+        # Microphone
+        print("  Mic:     ", end="", flush=True)
+        result = self.esp32.test_microphone()
+        if result:
+            status = result.get("status", "unknown")
+            peak = result.get("peak", "?")
+            if status == "ok":
+                print(f"OK (peak={peak})")
+            else:
+                print(f"ISSUE: {status}")
+                print("         Flash mic_diagnostic.cpp for detailed analysis")
+                print("         Wiring: SCK->14, WS->15, SD->32, L/R->GND, VDD->3.3V")
+        else:
+            print("No response")
+            print("         Is the new firmware flashed? (needs mic support)")
+
+        # Eyes
+        print("  Eyes:    ", end="", flush=True)
+        for e in ["happy", "surprised", "neutral"]:
+            self.esp32.send_emotion(e)
+            time.sleep(0.3)
+        print("OK")
+
+        print("-" * 22)
+
+    # ==================== LISTEN (ESP32 MIC ONLY) ====================
 
     def listen(self) -> str:
-        print("🎤 Listening... (speak now)")
-        self.esp32.send_emotion("neutral")
+        """Record from ESP32 INMP441 mic and transcribe with Whisper."""
+        print("Listening... (speak into ESP32 mic)")
+        self.esp32.send_emotion("listening")
         self.esp32.play_beep()
 
-        audio_data = self.mic.listen()
+        # Record from ESP32 mic (3 seconds)
+        self.esp32.send_emotion("recording")
+        wav_path = self.esp32.record_to_file(duration=3.0, filepath="D:\\test_mic.wav")
 
-        if not audio_data:
+        if not wav_path:
+            logger.warning("No audio recorded from ESP32 mic")
             return ""
 
+        # Check file size
+        file_size = Path(wav_path).stat().st_size
+        if file_size < 500:
+            logger.warning(f"Audio too small ({file_size} bytes)")
+            os.unlink(wav_path)
+            return ""
+
+        # Transcribe
         self.esp32.send_emotion("thinking")
-        print("🧠 Transcribing...")
+        print("Transcribing...")
 
         try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                f.write(audio_data)
-                temp_path = f.name
-
-            if hasattr(self.stt, 'transcribe_file'):
-                text = self.stt.transcribe_file(temp_path)
-            elif hasattr(self.stt, 'transcribe'):
-                text = self.stt.transcribe(temp_path)
-            elif hasattr(self.stt, 'model'):
-                result = self.stt.model.transcribe(temp_path)
-                text = result.get("text", "").strip()
-            else:
-                text = ""
-
-            os.unlink(temp_path)
-
-            if text:
-                print(f"👤 You: {text}")
-
-            return text or ""
-
+            text = self._transcribe_file(wav_path)
         except Exception as e:
             logger.error(f"Transcription error: {e}")
-            return ""
+            text = ""
+        finally:
+            # Keep test file for debugging, delete temp files only
+            if wav_path and "test_mic" not in wav_path:
+                try:
+                    os.unlink(wav_path)
+                except:
+                    pass
+
+        if text:
+            print(f"You: {text}")
+
+        return text or ""
+
+    def _transcribe_file(self, filepath: str) -> str:
+        """Run Whisper on an audio file."""
+        if hasattr(self.stt, 'transcribe'):
+            return self.stt.transcribe(filepath)
+        elif hasattr(self.stt, 'model'):
+            result = self.stt.model.transcribe(filepath, language="en", fp16=False)
+            return result.get("text", "").strip()
+        return ""
+
+    # ==================== THINK ====================
 
     def think(self, user_input: str) -> tuple:
-        print("🤔 Thinking...")
+        """Send to Gemini and extract response + emotion."""
+        print("Thinking...")
         self.esp32.send_emotion("thinking")
 
-        response_text, emotion = self.llm.generate_response(user_input)
+        response_text, llm_emotion = self.llm.generate_response(user_input)
 
-        if not emotion or emotion == "neutral":
-            response_text, emotion = EmotionExtractor.extract(response_text)
+        # Double-check emotion extraction
+        if not llm_emotion or llm_emotion == "neutral":
+            response_text, llm_emotion = EmotionExtractor.extract(response_text)
 
-        print(f"🤖 Freya: {response_text}")
-        print(f"   [Emotion: {emotion}]")
+        print(f"Freya: {response_text}")
+        print(f"  [{llm_emotion}]")
 
-        return response_text, emotion
+        return response_text, llm_emotion
+
+    # ==================== SPEAK (ESP32 SPEAKER ONLY) ====================
 
     def speak(self, text: str, emotion: str):
-        print("🔊 Speaking...")
-
+        """Synthesize speech and play on ESP32 speaker. No fallback."""
+        print("Speaking...")
         self.esp32.send_emotion(emotion)
-        time.sleep(0.3)
+        time.sleep(0.2)
 
         audio_bytes = self.tts.synthesize_to_bytes(text)
-
         if not audio_bytes:
-            logger.error("❌ TTS failed")
+            logger.error("TTS failed — no audio generated")
             return
 
-        logger.info(f"TTS generated {len(audio_bytes)} bytes")
+        logger.info(f"TTS: {len(audio_bytes)} bytes")
 
-        if self.esp32.connected:
-            success = self.esp32.send_audio(audio_bytes)
-            if not success:
-                self._play_on_pc(audio_bytes)
-        else:
-            self._play_on_pc(audio_bytes)
+        # ESP32 speaker only — auto-selects direct or streamed mode
+        success = self.esp32.send_audio(audio_bytes, gain=2.5)
+        if not success:
+            logger.error("ESP32 playback failed!")
 
-        time.sleep(0.5)
+        time.sleep(0.3)
         self.esp32.send_emotion("neutral")
-        print("✅ Done\n")
+        print("Done\n")
 
-    def _play_on_pc(self, audio_bytes: bytes):
-        logger.info("Playing on PC...")
-        try:
-            if hasattr(self.tts, 'play_audio_bytes'):
-                self.tts.play_audio_bytes(audio_bytes)
-            else:
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                    f.write(audio_bytes)
-                    temp_path = f.name
-                try:
-                    import pygame
-                    pygame.mixer.init()
-                    pygame.mixer.music.load(temp_path)
-                    pygame.mixer.music.play()
-                    while pygame.mixer.music.get_busy():
-                        time.sleep(0.1)
-                except ImportError:
-                    from playsound import playsound
-                    playsound(temp_path)
-                os.unlink(temp_path)
-        except Exception as e:
-            logger.error(f"PC playback failed: {e}")
+    # ==================== MAIN LOOP ====================
 
     def run(self):
         print("=" * 50)
-        print("🎤 Input:  PC Microphone → Whisper")
-        print("🧠 Brain:  Gemini LLM")
-        print("🔊 Output: ESP32 Speaker")
-        print("😊 Face:   ESP32 OLED")
+        print("  Mic:    ESP32 INMP441 (SCK=14, WS=15, SD=32)")
+        print("  Brain:  Gemini LLM")
+        print("  Voice:  Piper TTS -> ESP32 Speaker")
+        print("  Face:   ESP32 OLED")
         print("=" * 50)
         print("\nPress Ctrl+C to exit\n")
-        print("-" * 50 + "\n")
 
         try:
             while True:
                 user_input = self.listen()
 
                 if not user_input or len(user_input.strip()) < 2:
-                    print("⚠️ No speech detected\n")
+                    print("(no speech detected)\n")
                     self.esp32.send_emotion("neutral")
                     continue
 
                 response_text, emotion = self.think(user_input)
                 self.speak(response_text, emotion)
-
-                print("-" * 50 + "\n")
+                print("-" * 40 + "\n")
 
         except KeyboardInterrupt:
-            print("\n\n👋 Goodbye!")
+            print("\n\nGoodbye!")
             self.esp32.send_emotion("sleepy")
             time.sleep(1)
             self.esp32.send_emotion("neutral")
             self.esp32.disconnect()
 
 
+# ==================== CLI ====================
+
 def main():
-    if "--help" in sys.argv:
-        print("Usage: python main.py [--mic N] [--list-mics]")
-        sys.exit(0)
+    import argparse
 
-    if "--list-mics" in sys.argv:
-        for i, name in enumerate(sr.Microphone.list_microphone_names()):
-            print(f"[{i}] {name}")
-        sys.exit(0)
+    parser = argparse.ArgumentParser(description="FREYA Voice Assistant (ESP32 Only)")
+    parser.add_argument("--port", type=str, default=None, help="ESP32 COM port (e.g. COM4)")
+    parser.add_argument("--test", action="store_true", help="Run hardware diagnostics only")
 
-    mic_device = None
-    if "--mic" in sys.argv:
-        idx = sys.argv.index("--mic")
-        if idx + 1 < len(sys.argv):
-            mic_device = int(sys.argv[idx + 1])
+    args = parser.parse_args()
 
-    freya = FreyaAssistant(mic_device=mic_device)
+    if args.test:
+        from serial_handler import SerialBridge
+        from config import settings
+        port = args.port or getattr(settings, 'ESP32_COM_PORT', 'COM4')
+        bridge = SerialBridge(port)
+        if bridge.connect():
+            print(f"\nConnected at {bridge.baudrate} baud\n")
+            print("Speaker test...")
+            bridge.test_speaker()
+            time.sleep(1)
+            print("\nMic test...")
+            result = bridge.test_microphone()
+            print(f"  Result: {result}")
+            print("\nRecord 3 seconds (speak into mic)...")
+            wav_path = bridge.record_to_file(duration=3.0, filepath="test_recording.wav")
+            if wav_path:
+                size = Path(wav_path).stat().st_size
+                print(f"  Saved: {wav_path} ({size} bytes)")
+                print("  Play this file on PC to verify quality!")
+            else:
+                print("  Recording failed")
+            bridge.disconnect()
+        else:
+            print("Connection failed!")
+        return
+
+    freya = FreyaAssistant(esp_port=args.port)
     freya.run()
 
 

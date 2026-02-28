@@ -1,0 +1,112 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ArduinoJson.h>
+
+// OLED Settings
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define SCREEN_ADDRESS 0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+const char* EMOTION_FACES[] = {
+  "^",        // happy (smile)
+  "v",        // sad (frown)
+  "?",        // confused
+  "D",        // laugh (big smile)
+  "~",        // wave
+  ">",        // point
+  "o",        // nod (circle)
+  "-",        // shrug (line)
+  "X"         // angry
+};
+
+const char* EMOTION_NAMES[] = {
+  "happy", "sad", "confused", "laugh", "wave",
+  "point", "nod", "shrug", "angry"
+};
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize OLED
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println("SSD1306 allocation failed");
+    for(;;);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Freya");
+  display.println("Ready!");
+  display.display();
+
+  Serial.println("{\"type\":\"READY\"}");
+}
+
+void displayEmotion(String emotion) {
+  // Find matching emotion
+  const char* face = "^"; // happy default
+
+  for(int i = 0; i < 9; i++) {
+    if(emotion.equalsIgnoreCase(EMOTION_NAMES[i])) {
+      face = EMOTION_FACES[i];
+      break;
+    }
+  }
+
+  // Clear display
+  display.clearDisplay();
+  display.setTextSize(8);  // HUGE - one character fits perfectly
+  display.setTextColor(SSD1306_WHITE);
+
+  // Center single character
+  int16_t x = (128 - 48) / 2;  // Center horizontally
+  int16_t y = 0;                // Start at top
+
+  display.setCursor(x, y);
+  display.print(face);
+  display.display();
+
+  Serial.print("Displayed: ");
+  Serial.println(face);
+}
+
+void loop() {
+  // Check for incoming serial data
+  if (Serial.available()) {
+    String message = Serial.readStringUntil('\n');
+    message.trim();
+
+    // Parse JSON
+    JsonDocument doc;  // Updated from StaticJsonDocument
+    DeserializationError error = deserializeJson(doc, message);
+
+    if (error) {
+      Serial.print("JSON parse failed: ");
+      Serial.println(error.c_str());
+      return;
+    }
+
+    // Handle message type
+    const char* type = doc["type"];
+
+    if (strcmp(type, "EMOTION") == 0) {
+      String emotion = doc["value"].as<String>();
+      displayEmotion(emotion);
+    }
+    else if (strcmp(type, "TEXT") == 0) {
+      String text = doc["value"].as<String>();
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.println(text);
+      display.display();
+    }
+  }
+}
