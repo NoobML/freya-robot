@@ -422,6 +422,7 @@ class SerialBridge:
             logger.error("Too little audio data received")
             return None
 
+        audio_data = self.amplify_pcm(audio_data, gain=30.0)
         wav_data = self.pcm_to_wav(audio_data, sample_rate=sample_rate)
         logger.info(f"Created WAV: {len(wav_data)} bytes")
         return wav_data

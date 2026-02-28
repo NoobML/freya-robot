@@ -633,11 +633,18 @@ void handleCommand(String& line) {
             if (duration <= 0 || duration > 10) duration = 3.0;
         }
 
-        setEmotion(9);  // Alert/recording eyes
+       setEmotion(9);  // Alert/recording eyes
         Serial.printf("{\"type\":\"RECORDING\",\"duration\":%.1f}\n", duration);
+
+        // Stop speaker before recording (prevents I2S interference)
+        i2s_driver_uninstall(I2S_NUM_0);
+        delay(100);
 
         // Record
         size_t samples = recordAudio(duration);
+
+        // Restart speaker after recording
+        initSpeaker();
 
         if (samples == 0) {
             Serial.println("{\"type\":\"RECORD_FAIL\",\"msg\":\"no_samples\"}");
