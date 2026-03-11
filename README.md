@@ -727,11 +727,10 @@ This project is licensed under the MIT License - see [LICENSE](LICENSE) file for
 
 <div align="center">
 
-**Made with ❤️ by [Your Name]**
 
 If you found this project helpful, please consider giving it a ⭐!
 
-[Report Bug](https://github.com/yourusername/freya-robot/issues) • 
+[Report Bug](https://github.com/NoobML/freya-robot/issues) • 
 [Request Feature](https://github.com/yourusername/freya-robot/issues) • 
 [Documentation](https://github.com/yourusername/freya-robot/wiki)
 
