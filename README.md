@@ -579,6 +579,7 @@ freya-robot/
 ```
 
 ---
+---
 
 ## 🎯 Technical Specifications
 
