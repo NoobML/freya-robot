@@ -59,7 +59,7 @@ A fully-featured AI voice assistant powered by ESP32, featuring expressive OLED 
 - External enclosure/robot body
 - LED indicators
 
----
+------
 
 ## 🔌 Wiring Diagram
 
