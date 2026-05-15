@@ -15,7 +15,7 @@ A fully-featured AI voice assistant powered by ESP32, featuring expressive OLED 
 - 💃 **Body Language** - Dual servo motors with emotion-based movements
 - 📡 **Wireless** - Serial communication over USB (ESP32 ↔ PC)
 
----
+------
 
 ## 📋 Table of Contents
 
